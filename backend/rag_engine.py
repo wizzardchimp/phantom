@@ -1,22 +1,12 @@
 import json
-import os
 import re
 import sqlite3
 from pathlib import Path
 from typing import Optional
-from collections import Counter
 
 from .vector_store import VectorStore
-from .llm_client import check_ollama, list_ollama_models, ask_ollama, ask_openai
 
 DATA_DIR = Path(__file__).parent.parent / "data"
-
-SYSTEM_PROMPT = """You are analyzing an exfiltrated corporate dataset from NovaFi Financial Solutions. 
-Answer the user's question based ONLY on the retrieved context below. Be direct and concise. 
-If the context doesn't contain the answer, say so. Never make up information.
-
-Format your answer as a brief summary (2-4 sentences). If listing items, use bullet points.
-Highlight anything marked [CONFIDENTIAL] as it's a sensitive finding."""
 
 
 class DatabaseQuery:
@@ -99,9 +89,6 @@ class RAGEngine:
         self.db_path = db_path or str(DATA_DIR / "novafi.db")
         self.vector_store = VectorStore(db_path=self.db_path)
         self.db_query = DatabaseQuery(self.db_path)
-        self.llm_mode = None
-        self.llm_model = None
-        self._init_llm()
 
         secrets_path = DATA_DIR / "secrets.json"
         if secrets_path.exists():
@@ -110,29 +97,6 @@ class RAGEngine:
         else:
             self.secrets_data = {"secrets": []}
 
-        try:
-            self.vector_store.ensure_embeddings()
-        except Exception:
-            pass
-
-    def _init_llm(self):
-        api_key = os.getenv("OPENAI_API_KEY")
-        if api_key:
-            self.llm_mode = "openai"
-            self.llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-            return
-        if check_ollama():
-            models = list_ollama_models()
-            preferred = ["llama3.2:3b", "llama3.2", "llama3", "mistral", "phi3", "phi"]
-            for p in preferred:
-                if p in models:
-                    self.llm_mode = "ollama"
-                    self.llm_model = p
-                    return
-            if models:
-                self.llm_mode = "ollama"
-                self.llm_model = models[0]
-
     def query(self, question: str) -> dict:
         try:
             q = question.lower()
@@ -140,11 +104,7 @@ class RAGEngine:
             sql = self.db_query.infer_sql(question)
             sql_results = self.db_query.query(sql) if sql else []
             intent = self._classify_intent(q)
-
-            if self.llm_mode and intent not in ("salary_query", "employee_query", "customer_query", "order_query"):
-                response = self._llm_summary(question, emails, sql_results, intent)
-            else:
-                response = self._smart_template(question, emails, sql_results, intent)
+            response = self._smart_template(question, emails, sql_results, intent)
 
             return {
                 "query": question,
@@ -152,7 +112,7 @@ class RAGEngine:
                 "response": response,
                 "emails_found": len(emails),
                 "records_found": len(sql_results),
-                "llm_used": self.llm_mode is not None and intent not in ("salary_query", "employee_query", "customer_query", "order_query"),
+                "llm_used": False,
             }
         except Exception as exc:
             return {
@@ -190,39 +150,6 @@ class RAGEngine:
         if any(w in q for w in ["trouble", "problem", "issue", "conflict", "dispute", "complaint", "warning", "risk"]):
             return "trouble_query"
         return "general_query"
-
-    def _llm_summary(self, question: str, emails: list[dict], sql_results: list[dict], intent: str) -> str:
-        context_parts = []
-
-        if emails:
-            email_block = "RELEVANT EMAILS:\n"
-            for i, e in enumerate(emails[:8], 1):
-                tag = "[CONFIDENTIAL]" if e.get("sensitivity") == "confidential" else ""
-                email_block += f"{i}. {tag} From: {e['from_name']} ({e['department']}) → To: {e['to_name']}\n"
-                email_block += f"   Subject: {e['subject']}\n"
-                email_block += f"   Body: {e['body'][:500]}\n\n"
-            context_parts.append(email_block)
-
-        if sql_results:
-            context_parts.append(f"DATABASE RECORDS ({len(sql_results)}):\n" + json.dumps(sql_results[:5], indent=2))
-
-        if not emails and not sql_results:
-            return "No relevant data found for that question."
-
-        context = "\n".join(context_parts)
-
-        if self.llm_mode == "ollama":
-            result = ask_ollama(question, system=SYSTEM_PROMPT, prompt=f"Context:\n{context}")
-        elif self.llm_mode == "openai":
-            result = ask_openai(question, system=SYSTEM_PROMPT, prompt=f"Context:\n{context}",
-                                api_key=os.getenv("OPENAI_API_KEY", ""))
-        else:
-            return self._smart_template(question, emails, sql_results, intent)
-
-        result = (result or "").strip()
-        if result:
-            return result
-        return self._smart_template(question, emails, sql_results, intent)
 
     def _smart_template(self, question: str, emails: list[dict], sql_results: list[dict], intent: str) -> str:
         handlers = {
