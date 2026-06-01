@@ -110,7 +110,10 @@ class RAGEngine:
         else:
             self.secrets_data = {"secrets": []}
 
-        self.vector_store.build_async()
+        try:
+            self.vector_store.ensure_embeddings()
+        except Exception:
+            pass
 
     def _init_llm(self):
         api_key = os.getenv("OPENAI_API_KEY")
@@ -131,28 +134,35 @@ class RAGEngine:
                 self.llm_model = models[0]
 
     def query(self, question: str) -> dict:
-        q = question.lower()
+        try:
+            q = question.lower()
+            emails = self.vector_store.search(question, top_k=15)
+            sql = self.db_query.infer_sql(question)
+            sql_results = self.db_query.query(sql) if sql else []
+            intent = self._classify_intent(q)
 
-        emails = self.vector_store.search(question, top_k=15)
+            if self.llm_mode and intent not in ("salary_query", "employee_query", "customer_query", "order_query"):
+                response = self._llm_summary(question, emails, sql_results, intent)
+            else:
+                response = self._smart_template(question, emails, sql_results, intent)
 
-        sql = self.db_query.infer_sql(question)
-        sql_results = self.db_query.query(sql) if sql else []
-
-        intent = self._classify_intent(q)
-
-        if self.llm_mode and intent not in ("salary_query", "employee_query", "customer_query", "order_query"):
-            response = self._llm_summary(question, emails, sql_results, intent)
-        else:
-            response = self._smart_template(question, emails, sql_results, intent)
-
-        return {
-            "query": question,
-            "intent": intent,
-            "response": response,
-            "emails_found": len(emails),
-            "records_found": len(sql_results),
-            "llm_used": self.llm_mode is not None and intent not in ("salary_query", "employee_query", "customer_query", "order_query"),
-        }
+            return {
+                "query": question,
+                "intent": intent,
+                "response": response,
+                "emails_found": len(emails),
+                "records_found": len(sql_results),
+                "llm_used": self.llm_mode is not None and intent not in ("salary_query", "employee_query", "customer_query", "order_query"),
+            }
+        except Exception as exc:
+            return {
+                "query": question,
+                "intent": "error",
+                "response": f"[Error] Could not process query: {exc}",
+                "emails_found": 0,
+                "records_found": 0,
+                "llm_used": False,
+            }
 
     def _classify_intent(self, q: str) -> str:
         if any(w in q for w in ["boss", "ceo", "cfo", "cto", "executive", "leader", "manager", "supervisor", "head of", "in charge", "president"]):

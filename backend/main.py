@@ -79,13 +79,17 @@ async def get_stats():
     return stats
 
 
-@app.post("/query", response_model=QueryResponse)
+@app.post("/query")
 async def query_data(request: QueryRequest):
-    try:
-        result = engine.query(request.query)
-        return QueryResponse(**result)
-    except Exception as e:
-        raise HTTPException(500, f"Query failed: {str(e)}")
+    result = engine.query(request.query)
+    return {
+        "query": result["query"],
+        "intent": result.get("intent", "unknown"),
+        "response": result.get("response", "No response generated."),
+        "emails_found": result.get("emails_found", 0),
+        "records_found": result.get("records_found", 0),
+        "llm_used": result.get("llm_used", False),
+    }
 
 
 @app.post("/sql")
