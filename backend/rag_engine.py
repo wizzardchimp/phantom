@@ -50,15 +50,21 @@ class DatabaseQuery:
             (r"who.*(highest|most).*paid|top.*(earner|paid)", "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 10"),
             (r"(salar|pay).*(\d+)" , lambda m: f"SELECT name, position, department, salary FROM employees WHERE salary > {m.group(2)} ORDER BY salary DESC LIMIT 10"),
         ]
+        exec_patterns = [
+            (r"(boss|ceo|cto|cfo|chief|president|top.*exec|executive|leader|head of|in charge|who.*run|who.*lead)", 
+             "SELECT name, position, department, salary FROM employees WHERE department = 'Executive' OR position LIKE '%VP%' OR position LIKE '%Director%' ORDER BY salary DESC"),
+            (r"(who.*(manager|supervisor)|list.*(manager|supervisor))",
+             "SELECT name, position, department, salary FROM employees WHERE is_management = 1 ORDER BY department"),
+        ]
         employee_patterns = [
             (r"(how many|count).*employee|headcount|total.*employee", "SELECT department, COUNT(*) as count FROM employees GROUP BY department ORDER BY count DESC"),
-            (r"list.*employee|all.*employee|show.*employee", "SELECT name, position, department, email FROM employees ORDER BY department, name LIMIT 30"),
             (r"employee.*(engineer|engineering|tech|dev)", "SELECT name, position, department, salary FROM employees WHERE department = 'Engineering' ORDER BY salary DESC"),
             (r"employee.*(hr|human.?resources)", "SELECT name, position, salary FROM employees WHERE department = 'Human Resources' ORDER BY name"),
             (r"employee.*(sales|marketing)", "SELECT name, position, department, salary FROM employees WHERE department IN ('Sales', 'Marketing') ORDER BY department, name"),
             (r"employee.*(executive|c.?suite|ceo|cfo|cto)", "SELECT name, position, department, salary FROM employees WHERE department = 'Executive' ORDER BY salary DESC"),
             (r"employee.*(finance|accounting)", "SELECT name, position, salary FROM employees WHERE department = 'Finance' ORDER BY name"),
             (r"(who|which).*(manager|management|director|vp)", "SELECT name, position, department, salary FROM employees WHERE is_management = 1 ORDER BY department"),
+            (r"list.*employee|all.*employee|show.*employee", "SELECT name, position, department, email FROM employees ORDER BY department, name LIMIT 30"),
         ]
         customer_patterns = [
             (r"(how many|count).*customer", "SELECT COUNT(*) as total_customers FROM customers"),
@@ -81,9 +87,9 @@ class DatabaseQuery:
             (r"(email|mail).*(ceo|executive|exec|confidential|secret)", None),  # handled by vector search
         ]
 
-        for patterns, target in [ (salary_patterns, "employees"), (employee_patterns, "employees"),
-                                  (customer_patterns, "customers"), (order_patterns, "orders"),
-                                  (payroll_patterns, "payroll") ]:
+        for patterns, target in [ (exec_patterns, "employees"), (salary_patterns, "employees"),
+                                  (employee_patterns, "employees"), (customer_patterns, "customers"),
+                                  (order_patterns, "orders"), (payroll_patterns, "payroll") ]:
             for pattern, sql in patterns:
                 if callable(sql):
                     m = re.search(pattern, q)
@@ -162,7 +168,9 @@ class RAGEngine:
     def _classify_intent(self, q: str) -> str:
         if any(w in q for w in ["salar", "pay", "compensation", "bonus", "top earn", "highest paid", "lowest paid", "payroll"]):
             return "salary_query"
-        if any(w in q for w in ["employee", "staff", "people", "who", "manage", "hire", "headcount", "workforce"]):
+        if any(w in q for w in ["boss", "ceo", "cfo", "cto", "executive", "leader", "manager", "supervisor", "head of", "in charge", "president"]):
+            return "executive_query"
+        if any(w in q for w in ["employee", "staff", "people", "who", "hire", "headcount", "workforce"]):
             return "employee_query"
         if any(w in q for w in ["customer", "client", "user"]):
             return "customer_query"
@@ -172,16 +180,17 @@ class RAGEngine:
             return "security_query"
         if any(w in q for w in ["layoff", "fire", "terminate", "offshore", "phoenix"]):
             return "layoff_query"
-        if any(w in q for w in ["affair", "relationship", "affair", "personal"]):
+        if any(w in q for w in ["affair", "relationship", "personal"]):
             return "personal_query"
         if any(w in q for w in ["email", "mail", "message", "thread", "communicat"]):
             return "email_query"
-        if any(w in q for w in ["secrets", "secrets", "easter egg", "hidden", "plant"]):
+        if any(w in q for w in ["secrets", "easter egg", "hidden", "plant"]):
             return "secrets_query"
         return "general_query"
 
     def _template_answer(self, question: str, emails: list[dict], sql_results: list[dict], intent: str) -> str:
         intent_responses = {
+            "executive_query": self._answer_executive,
             "salary_query": self._answer_salary,
             "employee_query": self._answer_employees,
             "customer_query": self._answer_customers,
@@ -196,152 +205,163 @@ class RAGEngine:
         handler = intent_responses.get(intent, self._answer_general)
         return handler(question, emails, sql_results)
 
+    def _answer_executive(self, question, emails, sql_results) -> str:
+        execs = [r for r in sql_results if r.get('department') == 'Executive']
+        if not execs:
+            from .rag_engine import DatabaseQuery
+            dq = DatabaseQuery(self.db_path)
+            execs = dq.query("SELECT name, position, department, salary FROM employees WHERE department = 'Executive' ORDER BY salary DESC")
+        if execs:
+            lines = ["Executive team at NovaFi Financial:\n"]
+            ceo_name = None
+            for e in execs:
+                lines.append(f"  \u2022 {e['name']} — {e['position']} (${e['salary']:,})")
+                if e.get('position') == 'CEO':
+                    ceo_name = e['name']
+            if ceo_name:
+                lines.append(f"\nThe CEO is {ceo_name}.")
+            return "\n".join(lines)
+        return "No executive records found."
+
     def _answer_salary(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Salary Analysis"]
-        lines.append(">>> ACCESS GRANTED: PAYROLL DATABASE")
-        if sql_results:
-            lines.append(f"{'DEPARTMENT':<25} {'ROLE':<30} {'SALARY':<12}")
-            lines.append("-" * 67)
-            for r in sql_results:
-                lines.append(f"{r.get('name', r.get('department', '')):<25} {r.get('position', ''):<30} ${r.get('salary', r.get('avg_salary', 0)):<10,}")
-        if email_data := [e for e in emails if "salary" in e.get("subject", "").lower() or "salary" in e.get("body", "").lower()]:
-            lines.append("\n>>> RELATED EMAIL REFERENCES:")
-            for e in email_data[:3]:
-                lines.append(f"  [{e['department']}] {e['subject']}")
-        lines.append("\n>>> NOTE: Salary data is confidential. Do not share externally.")
+        if not sql_results:
+            return "No salary data found."
+        lines = [f"Found {len(sql_results)} salary records:\n"]
+        for r in sql_results[:10]:
+            name = r.get('name', r.get('department', 'Unknown'))
+            pos = r.get('position', '')
+            salary = r.get('salary', r.get('avg_salary', 0))
+            if 'avg_salary' in r or 'department' in r and 'count' not in r:
+                lines.append(f"  \u2022 {name}: ${salary:,}/yr (avg)")
+            else:
+                lines.append(f"  \u2022 {name} ({pos}): ${salary:,}/yr")
         return "\n".join(lines)
 
     def _answer_employees(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Employee Records"]
-        lines.append(">>> ACCESS GRANTED: HR DATABASE")
-        if sql_results:
+        if not sql_results:
+            return "No employee records found."
+        if 'count' in sql_results[0]:
+            lines = ["Employee count by department:\n"]
             for r in sql_results:
-                if 'department' in r and 'count' in r:
-                    lines.append(f"  {r['department']:<25} {r['count']} employees")
-                else:
-                    lines.append(f"  {r.get('name', 'N/A'):<25} | {r.get('position', r.get('email', ''))}")
-        if not sql_results and emails:
-            for e in emails[:5]:
-                lines.append(f"  [{e['department']}] {e['from_name']}: {e['subject']}")
-        lines.append(f"\n>>> {len(sql_results) if sql_results else len(emails)} records returned")
+                lines.append(f"  \u2022 {r['department']}: {r['count']} employees")
+            return "\n".join(lines)
+        lines = [f"Found {len(sql_results)} employees:\n"]
+        for r in sql_results[:10]:
+            lines.append(f"  \u2022 {r['name']} — {r.get('position', r.get('email', ''))}")
         return "\n".join(lines)
 
     def _answer_customers(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Customer Records"]
-        lines.append(">>> ACCESS GRANTED: CUSTOMER DATABASE")
-        if sql_results:
-            for r in sql_results:
-                if 'total_customers' in r:
-                    lines.append(f"  Total Customers: {r['total_customers']}")
-                else:
-                    masked_cc = r.get('credit_card_number', '')[:4] + " **** **** " + r.get('credit_card_number', '')[-4:] if r.get('credit_card_number') else ''
-                    lines.append(f"  {r.get('name', 'N/A'):<25} Risk: {r.get('risk_score', 'N/A')} Card: {masked_cc}")
-        else:
-            lines.append("  No matching records found via structured query.")
-            if emails:
-                lines.append("\n>>> Related communications found:")
-                for e in emails[:3]:
-                    lines.append(f"  {e['subject']}")
-        lines.append("\n>>> WARNING: Customer PII is regulated data. Handle with care.")
+        if not sql_results:
+            found_emails = [e for e in emails if any(w in (e.get('subject','') + e.get('body','')).lower()
+                            for w in ['customer', 'client', 'data', 'breach', 'phish', 'account'])]
+            if found_emails:
+                lines = ["No direct customer database results. Relevant emails found:\n"]
+                for e in found_emails[:3]:
+                    lines.append(f"  \u2022 {e['subject']} ({e['from_name']})")
+                return "\n".join(lines)
+            return "No customer records found."
+        if 'total_customers' in sql_results[0]:
+            return f"Total customers in database: {sql_results[0]['total_customers']}"
+        lines = [f"Found {len(sql_results)} customer records:\n"]
+        for r in sql_results[:5]:
+            name = r['name']
+            cc = r.get('credit_card_number', '')
+            masked = f"{cc[:4]} **** **** {cc[-4:]}" if len(cc) > 4 else ''
+            risk = r.get('risk_score', '')
+            lines.append(f"  \u2022 {name} | Card: {masked} | Risk: {risk}")
         return "\n".join(lines)
 
     def _answer_orders(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Order & Transaction Records"]
-        lines.append(">>> ACCESS GRANTED: FINANCIAL DATABASE")
-        if sql_results:
+        if not sql_results:
+            return "No order records found."
+        if 'total_revenue' in sql_results[0]:
+            r = sql_results[0]
+            return f"Total orders: {r['total_orders']} | Total revenue: ${r['total_revenue']:,}"
+        if 'revenue' in sql_results[0]:
+            lines = ["Monthly revenue:\n"]
             for r in sql_results:
-                if 'total_revenue' in r:
-                    lines.append(f"  Total Orders: {r['total_orders']} | Total Revenue: ${r['total_revenue']:,}")
-                elif 'revenue' in r:
-                    lines.append(f"  {r['month']:<10} Orders: {r['orders']:<5} Revenue: ${r['revenue']:>10,}")
-                else:
-                    lines.append(f"  {r.get('customer_name', 'N/A'):<25} ${r.get('amount', 0):>8,} | {r.get('product', '')} | {r.get('status', '')}")
+                lines.append(f"  \u2022 {r['month']}: ${r['revenue']:,} ({r['orders']} orders)")
+            return "\n".join(lines[:6])
+        lines = [f"Found {len(sql_results)} orders:\n"]
+        for r in sql_results[:5]:
+            lines.append(f"  \u2022 {r['customer_name']} — {r['product']} — ${r['amount']:,.0f} ({r['status']})")
         return "\n".join(lines)
 
     def _answer_security(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Security Incident Analysis"]
-        lines.append(">>> ACCESSING SECURITY LOGS...")
         relevant = [e for e in emails if e.get('relevance_score', 0) > 0.3]
         if relevant:
-            lines.append(f">>> {len(relevant)} relevant security communications found:")
+            lines = [f"Found {len(relevant)} emails related to security:\n"]
             for e in relevant[:5]:
                 sens = " [CONFIDENTIAL]" if e.get('sensitivity') == "confidential" else ""
-                lines.append(f"  [{e['department']}]{sens} {e['subject']}")
-                if 'password' in e.get('body', '').lower() or 'credential' in e.get('body', '').lower():
-                    snippet = e['body'][:200]
-                    lines.append(f"    >> Contains potential credential exposure: {snippet}")
-        else:
-            lines.append("  No direct security incidents found in indexed data.")
-        lines.append("\n>>> WARNING: Security incidents must be reported per compliance policy.")
-        return "\n".join(lines)
+                lines.append(f"  \u2022 {e['subject']}{sens} ({e['department']})")
+                if any(w in e.get('body','').lower() for w in ['password', 'credential']):
+                    lines.append(f"    — Contains exposed credentials")
+                if any(w in e.get('body','').lower() for w in ['breach', 'exposed', 'compromised']):
+                    lines.append(f"    — Data breach related")
+            return "\n".join(lines)
+        return "No security-related communications found in the dataset."
 
     def _answer_layoffs(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Layoff / Restructuring Intelligence"]
-        lines.append(">>> ACCESSING CONFIDENTIAL HR FILES...")
         relevant = [e for e in emails if e.get('relevance_score', 0) > 0.2]
-        if relevant:
-            for e in relevant[:4]:
-                sens = " [CONFIDENTIAL]" if e.get('sensitivity') == "confidential" else ""
-                lines.append(f"  [{e['department']}]{sens} {e['subject']}")
-                lines.append(f"  From: {e['from_name']} | {e['timestamp']}")
-                lines.append(f"  {e['body'][:200]}\n")
-        else:
-            lines.append("  No explicit layoff communications found.")
+        if not relevant:
+            return "No documents about layoffs or restructuring found."
+        lines = [f"Found {len(relevant)} internal communications about restructuring:\n"]
+        for e in relevant[:4]:
+            sens = " [CONFIDENTIAL]" if e.get('sensitivity') == "confidential" else ""
+            lines.append(f"  \u2022 {e['subject']}{sens}")
+            lines.append(f"    From: {e['from_name']} ({e['timestamp'][:10]})")
+            body_lower = e.get('body', '').lower()
+            if 'phoenix' in body_lower:
+                lines.append(f"    — References Project Phoenix (workforce reduction)")
+            if 'offshore' in body_lower:
+                lines.append(f"    — Discusses offshoring plans")
         return "\n".join(lines)
 
     def _answer_personal(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Personal / Relationship Intelligence"]
-        lines.append(">>> ACCESSING CONFIDENTIAL COMMUNICATIONS...")
         relevant = [e for e in emails if e.get('sensitivity') == "confidential"]
-        personal = [e for e in relevant if ('dinner' in e.get('body', '').lower()
-                    or 'personal' in e.get('body', '').lower() or 'paris' in e.get('body', '').lower())]
-        if personal:
-            for e in personal[:4]:
-                lines.append(f"  [{e['department']}] Subject: {e['subject']}")
-                lines.append(f"  From: {e['from_name']} To: {e['to_name']}")
-                lines.append(f"  {e['body'][:300]}\n")
+        personal = [e for e in relevant if any(w in e.get('body', '').lower()
+                    for w in ['dinner', 'paris', 'personal', 'weekend'])]
+        if not personal:
+            return "No personal or confidential communications found in this dataset."
+        lines = [f"Found {len(personal)} confidential personal communications:\n"]
+        for e in personal[:4]:
+            lines.append(f"  \u2022 {e['subject']}")
+            lines.append(f"    {e['from_name']} \u2192 {e['to_name']}")
+            lines.append(f"    {e['body'][:200]}")
         return "\n".join(lines)
 
     def _answer_emails(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: Email Search Results"]
-        lines.append(f">>> {len(emails)} relevant messages found")
-        if emails:
-            for e in emails[:8]:
-                ts = e['timestamp'][:19].replace('T', ' ')
-                sens = " [CONFIDENTIAL]" if e.get('sensitivity') == "confidential" else ""
-                lines.append(f"\n  [{ts}] {e['department']}{sens}")
-                lines.append(f"  From: {e['from_name']} <{e['from_addr']}>")
-                lines.append(f"  To: {e['to_name']} <{e['to_addr']}>")
-                lines.append(f"  Subject: {e['subject']}")
-                lines.append(f"  {e['body'][:200]}...")
+        if not emails:
+            return "No emails matched your query."
+        lines = [f"Found {len(emails)} relevant emails:\n"]
+        for e in emails[:8]:
+            ts = e['timestamp'][:19].replace('T', ' ')
+            sens = " [CONF]" if e.get('sensitivity') == "confidential" else ""
+            lines.append(f"  \u2022 {ts}{sens}")
+            lines.append(f"    {e['from_name']} \u2192 {e['to_name']}")
+            lines.append(f"    Subject: {e['subject']}")
         return "\n".join(lines)
 
     def _answer_secrets(self, question, emails, sql_results) -> str:
-        lines = [">>> DATABASE EASTER EGGS / PLANTED SECRETS"]
-        lines.append(">>> The following secrets were planted in the dataset for players to discover:\n")
+        lines = ["Planted secrets in the NovaFi dataset:\n"]
         for s in self.secrets_data.get("secrets", []):
-            lines.append(f"[{s['difficulty']}] {s['name']}")
-            lines.append(f"  {s['description']}")
-            lines.append(f"  Location: {s['found_in']}\n")
+            lines.append(f"  [{s['difficulty']}] {s['name']}")
+            lines.append(f"    {s['description']}")
         return "\n".join(lines)
 
     def _answer_general(self, question, emails, sql_results) -> str:
-        lines = [">>> QUERY: General Intelligence"]
+        parts = []
         if emails:
-            lines.append(f">>> Found {len(emails)} relevant emails:")
-            for e in emails[:5]:
-                lines.append(f"  [{e['department']}] {e['subject']} ({e['from_name']})")
+            parts.append(f"Found {len(emails)} relevant emails in the dataset.")
+            for e in emails[:3]:
+                parts.append(f"  \u2022 {e['subject']} ({e['department']}, {e['from_name']})")
         if sql_results:
-            lines.append(f"\n>>> Database records: {len(sql_results)}")
-            for r in sql_results[:5]:
-                lines.append(f"  {r}")
-        if not emails and not sql_results:
-            lines.append("  No direct results found. Try being more specific, or search by:")
-            lines.append("  - employee names, salaries, departments")
-            lines.append("  - customer data, orders, transactions")
-            lines.append("  - keywords like 'layoff', 'password', 'breach', 'complaint'")
-            lines.append("  - confidential communications / secrets")
-        return "\n".join(lines)
+            parts.append(f"\n{len(sql_results)} database records found.")
+            for r in sql_results[:3]:
+                parts.append(f"  \u2022 {r}")
+        if not parts:
+            return "No results found. Try searching for: employees, salaries, customers, orders, security incidents, or specific topics like layoffs or breaches."
+        return "\n".join(parts)
 
     def _llm_answer(self, question: str, context: str, llm_client, intent: str) -> str:
         system_prompt = """You are a cybersecurity investigation assistant. You have accessed a corporate dataset from NovaFi Financial Solutions.
