@@ -43,6 +43,7 @@ class DatabaseQuery:
         q = question.lower()
 
         salary_patterns = [
+            (r"(salar|payroll|compensation|wage)", "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 20"),
             (r"(highest|top|max|maximum).*salar", "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 5"),
             (r"(lowest|bottom|min|minimum).*salar", "SELECT name, position, department, salary FROM employees ORDER BY salary ASC LIMIT 5"),
             (r"average.*salar", "SELECT department, ROUND(AVG(salary), 0) as avg_salary FROM employees GROUP BY department ORDER BY avg_salary DESC"),
