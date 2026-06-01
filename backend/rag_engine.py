@@ -1,12 +1,22 @@
 import json
-import sqlite3
+import os
 import re
+import sqlite3
 from pathlib import Path
 from typing import Optional
+from collections import Counter
 
 from .vector_store import VectorStore
+from .llm_client import check_ollama, list_ollama_models, ask_ollama, ask_openai
 
 DATA_DIR = Path(__file__).parent.parent / "data"
+
+SYSTEM_PROMPT = """You are analyzing an exfiltrated corporate dataset from NovaFi Financial Solutions. 
+Answer the user's question based ONLY on the retrieved context below. Be direct and concise. 
+If the context doesn't contain the answer, say so. Never make up information.
+
+Format your answer as a brief summary (2-4 sentences). If listing items, use bullet points.
+Highlight anything marked [CONFIDENTIAL] as it's a sensitive finding."""
 
 
 class DatabaseQuery:
@@ -26,78 +36,61 @@ class DatabaseQuery:
             conn.close()
             return [{"error": str(e)}]
 
-    def get_table_schema(self) -> str:
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [r[0] for r in c.fetchall()]
-        schema_parts = []
-        for table in tables:
-            c.execute(f"PRAGMA table_info({table})")
-            cols = [f"  {r[1]} ({r[2]})" for r in c.fetchall()]
-            schema_parts.append(f"TABLE {table}:\n" + "\n".join(cols))
-        conn.close()
-        return "\n\n".join(schema_parts)
-
-    def infer_query(self, question: str) -> Optional[str]:
+    def infer_sql(self, question: str) -> Optional[str]:
         q = question.lower()
-
-        salary_patterns = [
-            (r"(salar|payroll|compensation|wage)", "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 20"),
-            (r"(highest|top|max|maximum).*salar", "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 5"),
-            (r"(lowest|bottom|min|minimum).*salar", "SELECT name, position, department, salary FROM employees ORDER BY salary ASC LIMIT 5"),
-            (r"average.*salar", "SELECT department, ROUND(AVG(salary), 0) as avg_salary FROM employees GROUP BY department ORDER BY avg_salary DESC"),
-            (r"who.*(highest|most).*paid|top.*(earner|paid)", "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 10"),
-            (r"(salar|pay).*(\d+)" , lambda m: f"SELECT name, position, department, salary FROM employees WHERE salary > {m.group(2)} ORDER BY salary DESC LIMIT 10"),
-        ]
-        exec_patterns = [
-            (r"(boss|ceo|cto|cfo|chief|president|top.*exec|executive|leader|head of|in charge|who.*run|who.*lead)", 
+        patterns = [
+            (r"(boss|ceo|cto|cfo|chief|president|executive|leader|head of|in charge|who.*run|who.*lead)",
              "SELECT name, position, department, salary FROM employees WHERE department = 'Executive' OR position LIKE '%VP%' OR position LIKE '%Director%' ORDER BY salary DESC"),
-            (r"(who.*(manager|supervisor)|list.*(manager|supervisor))",
+            (r"(salar|payroll|compensation|wage)",
+             "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 20"),
+            (r"(highest|top|max|maximum).*salar",
+             "SELECT name, position, department, salary FROM employees ORDER BY salary DESC LIMIT 5"),
+            (r"(lowest|bottom|min|minimum).*salar",
+             "SELECT name, position, department, salary FROM employees ORDER BY salary ASC LIMIT 5"),
+            (r"average.*salar",
+             "SELECT department, ROUND(AVG(salary), 0) as avg_salary FROM employees GROUP BY department ORDER BY avg_salary DESC"),
+            (r"(how many|count).*employee|headcount|total.*employee",
+             "SELECT department, COUNT(*) as count FROM employees GROUP BY department ORDER BY count DESC"),
+            (r"employee.*(engineer|engineering|tech|dev)",
+             "SELECT name, position, department, salary FROM employees WHERE department = 'Engineering' ORDER BY salary DESC"),
+            (r"employee.*(hr|human.?resources)",
+             "SELECT name, position, salary FROM employees WHERE department = 'Human Resources' ORDER BY name"),
+            (r"employee.*(sales|marketing)",
+             "SELECT name, position, department, salary FROM employees WHERE department IN ('Sales', 'Marketing') ORDER BY department, name"),
+            (r"employee.*(executive|c.?suite|ceo|cfo|cto)",
+             "SELECT name, position, department, salary FROM employees WHERE department = 'Executive' ORDER BY salary DESC"),
+            (r"employee.*(finance|accounting)",
+             "SELECT name, position, salary FROM employees WHERE department = 'Finance' ORDER BY name"),
+            (r"(who|which).*(manager|management|director|vp)",
              "SELECT name, position, department, salary FROM employees WHERE is_management = 1 ORDER BY department"),
+            (r"list.*employee|all.*employee|show.*employee",
+             "SELECT name, position, department, email FROM employees ORDER BY department, name LIMIT 30"),
+            (r"(how many|count).*customer",
+             "SELECT COUNT(*) as total_customers FROM customers"),
+            (r"(high.?risk|risk.*score).*customer",
+             "SELECT name, email, risk_score FROM customers WHERE risk_score > 75 ORDER BY risk_score DESC LIMIT 10"),
+            (r"customer.*(card|credit|payment)",
+             "SELECT name, credit_card_type, credit_card_number FROM customers LIMIT 10"),
+            (r"list.*customer|all.*customer",
+             "SELECT name, email, account_created FROM customers ORDER BY account_created DESC LIMIT 20"),
+            (r"(how many|total|count).*order",
+             "SELECT COUNT(*) as total_orders, ROUND(SUM(amount), 0) as total_revenue FROM orders"),
+            (r"(highest|top|largest).*order",
+             "SELECT customer_name, product, amount, status FROM orders ORDER BY amount DESC LIMIT 10"),
+            (r"(pending|processing).*order",
+             "SELECT customer_name, product, amount, status FROM orders WHERE status IN ('pending', 'processing') ORDER BY amount DESC LIMIT 10"),
+            (r"order.*(refund|disputed|dispute)",
+             "SELECT customer_name, product, amount, status FROM orders WHERE status IN ('refunded', 'disputed') LIMIT 10"),
+            (r"revenue|total.*amount|sales",
+             "SELECT STRFTIME('%Y-%m', created_at) as month, COUNT(*) as orders, ROUND(SUM(amount), 0) as revenue FROM orders GROUP BY month ORDER BY month DESC LIMIT 12"),
+            (r"(payroll|total.*payroll|salary.*cost)",
+             "SELECT ROUND(SUM(salary), 0) as total_annual_payroll FROM employees"),
+            (r"(bonus|bonuses)",
+             "SELECT employee_name, bonuses, pay_period_start FROM payroll WHERE bonuses > 0 ORDER BY bonuses DESC LIMIT 10"),
         ]
-        employee_patterns = [
-            (r"(how many|count).*employee|headcount|total.*employee", "SELECT department, COUNT(*) as count FROM employees GROUP BY department ORDER BY count DESC"),
-            (r"employee.*(engineer|engineering|tech|dev)", "SELECT name, position, department, salary FROM employees WHERE department = 'Engineering' ORDER BY salary DESC"),
-            (r"employee.*(hr|human.?resources)", "SELECT name, position, salary FROM employees WHERE department = 'Human Resources' ORDER BY name"),
-            (r"employee.*(sales|marketing)", "SELECT name, position, department, salary FROM employees WHERE department IN ('Sales', 'Marketing') ORDER BY department, name"),
-            (r"employee.*(executive|c.?suite|ceo|cfo|cto)", "SELECT name, position, department, salary FROM employees WHERE department = 'Executive' ORDER BY salary DESC"),
-            (r"employee.*(finance|accounting)", "SELECT name, position, salary FROM employees WHERE department = 'Finance' ORDER BY name"),
-            (r"(who|which).*(manager|management|director|vp)", "SELECT name, position, department, salary FROM employees WHERE is_management = 1 ORDER BY department"),
-            (r"list.*employee|all.*employee|show.*employee", "SELECT name, position, department, email FROM employees ORDER BY department, name LIMIT 30"),
-        ]
-        customer_patterns = [
-            (r"(how many|count).*customer", "SELECT COUNT(*) as total_customers FROM customers"),
-            (r"(high.?risk|risk.*score).*customer", "SELECT name, email, risk_score FROM customers WHERE risk_score > 75 ORDER BY risk_score DESC LIMIT 10"),
-            (r"customer.*(card|credit|payment)", "SELECT name, credit_card_type, credit_card_number FROM customers LIMIT 10"),
-            (r"list.*customer|all.*customer", "SELECT name, email, account_created FROM customers ORDER BY account_created DESC LIMIT 20"),
-        ]
-        order_patterns = [
-            (r"(how many|total|count).*order", "SELECT COUNT(*) as total_orders, ROUND(SUM(amount), 0) as total_revenue FROM orders"),
-            (r"(highest|top|largest).*order", "SELECT customer_name, product, amount, status FROM orders ORDER BY amount DESC LIMIT 10"),
-            (r"(pending|processing).*order", "SELECT customer_name, product, amount, status FROM orders WHERE status IN ('pending', 'processing') ORDER BY amount DESC LIMIT 10"),
-            (r"order.*(refund|disputed|dispute)", "SELECT customer_name, product, amount, status FROM orders WHERE status IN ('refunded', 'disputed') LIMIT 10"),
-            (r"revenue|total.*amount|sales", "SELECT STRFTIME('%Y-%m', created_at) as month, COUNT(*) as orders, ROUND(SUM(amount), 0) as revenue FROM orders GROUP BY month ORDER BY month DESC LIMIT 12"),
-        ]
-        payroll_patterns = [
-            (r"(payroll|total.*payroll|salary.*cost)", "SELECT ROUND(SUM(salary), 0) as total_annual_payroll FROM employees"),
-            (r"(bonus|bonuses)", "SELECT employee_name, bonuses, pay_period_start FROM payroll WHERE bonuses > 0 ORDER BY bonuses DESC LIMIT 10"),
-        ]
-        email_patterns = [
-            (r"(email|mail).*(ceo|executive|exec|confidential|secret)", None),  # handled by vector search
-        ]
-
-        for patterns, target in [ (exec_patterns, "employees"), (salary_patterns, "employees"),
-                                  (employee_patterns, "employees"), (customer_patterns, "customers"),
-                                  (order_patterns, "orders"), (payroll_patterns, "payroll") ]:
-            for pattern, sql in patterns:
-                if callable(sql):
-                    m = re.search(pattern, q)
-                    if m:
-                        return sql(m)
-                elif re.search(pattern, q):
-                    return sql
-
+        for pattern, sql in patterns:
+            if re.search(pattern, q):
+                return sql
         return None
 
 
@@ -106,6 +99,9 @@ class RAGEngine:
         self.db_path = db_path or str(DATA_DIR / "novafi.db")
         self.vector_store = VectorStore(db_path=self.db_path)
         self.db_query = DatabaseQuery(self.db_path)
+        self.llm_mode = None
+        self.llm_model = None
+        self._init_llm()
 
         secrets_path = DATA_DIR / "secrets.json"
         if secrets_path.exists():
@@ -114,63 +110,56 @@ class RAGEngine:
         else:
             self.secrets_data = {"secrets": []}
 
-    def summarize_context(self, emails: list[dict], sql_results: list[dict]) -> str:
-        parts = []
+        self.vector_store.build_async()
 
-        if emails:
-            email_lines = ["--- RELEVANT EMAILS ---"]
-            for e in emails[:5]:
-                email_lines.append(
-                    f"[{e['department']}] {e['from_name']} -> {e['to_name']} | "
-                    f"Subject: {e['subject']} | Score: {e.get('relevance_score', 'N/A')}"
-                )
-                email_lines.append(f"Snippet: {e['body'][:300]}")
-                email_lines.append("")
-            parts.append("\n".join(email_lines))
+    def _init_llm(self):
+        api_key = os.getenv("OPENAI_API_KEY")
+        if api_key:
+            self.llm_mode = "openai"
+            self.llm_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            return
+        if check_ollama():
+            models = list_ollama_models()
+            preferred = ["llama3.2:3b", "llama3.2", "llama3", "mistral", "phi3", "phi"]
+            for p in preferred:
+                if p in models:
+                    self.llm_mode = "ollama"
+                    self.llm_model = p
+                    return
+            if models:
+                self.llm_mode = "ollama"
+                self.llm_model = models[0]
 
-        if sql_results:
-            sql_lines = ["--- DATABASE RESULTS ---"]
-            for row in sql_results[:10]:
-                sql_lines.append(str(row))
-            parts.append("\n".join(sql_lines))
+    def query(self, question: str) -> dict:
+        q = question.lower()
 
-        return "\n".join(parts)
+        emails = self.vector_store.search(question, top_k=15)
 
-    def query(self, question: str, use_llm: bool = False, llm_client=None) -> dict:
-        question_lower = question.lower()
+        sql = self.db_query.infer_sql(question)
+        sql_results = self.db_query.query(sql) if sql else []
 
-        sql = self.db_query.infer_query(question)
-        sql_results = []
-        if sql:
-            sql_results = self.db_query.query(sql)
+        intent = self._classify_intent(q)
 
-        vector_results = self.vector_store.search(question, top_k=10)
-
-        intent = self._classify_intent(question_lower)
-        context = self.summarize_context(vector_results, sql_results)
-
-        if use_llm and llm_client:
-            response = self._llm_answer(question, context, llm_client, intent)
+        if self.llm_mode and intent not in ("salary_query", "employee_query", "customer_query", "order_query"):
+            response = self._llm_summary(question, emails, sql_results, intent)
         else:
-            response = self._template_answer(question, vector_results, sql_results, intent)
+            response = self._smart_template(question, emails, sql_results, intent)
 
         return {
             "query": question,
             "intent": intent,
             "response": response,
-            "emails_found": len(vector_results),
+            "emails_found": len(emails),
             "records_found": len(sql_results),
-            "top_emails": vector_results[:5],
-            "sql_results": sql_results[:10],
-            "sql_used": sql,
+            "llm_used": self.llm_mode is not None and intent not in ("salary_query", "employee_query", "customer_query", "order_query"),
         }
 
     def _classify_intent(self, q: str) -> str:
-        if any(w in q for w in ["salar", "pay", "compensation", "bonus", "top earn", "highest paid", "lowest paid", "payroll"]):
-            return "salary_query"
         if any(w in q for w in ["boss", "ceo", "cfo", "cto", "executive", "leader", "manager", "supervisor", "head of", "in charge", "president"]):
             return "executive_query"
-        if any(w in q for w in ["employee", "staff", "people", "who", "hire", "headcount", "workforce"]):
+        if any(w in q for w in ["salar", "pay", "compensation", "bonus", "payroll", "earn"]):
+            return "salary_query"
+        if any(w in q for w in ["employee", "staff", "people", "hire", "headcount", "workforce", "who work"]):
             return "employee_query"
         if any(w in q for w in ["customer", "client", "user"]):
             return "customer_query"
@@ -182,14 +171,51 @@ class RAGEngine:
             return "layoff_query"
         if any(w in q for w in ["affair", "relationship", "personal"]):
             return "personal_query"
+        if any(w in q for w in ["hiding", "secret", "cover", "controversial", "scandal"]):
+            return "hiding_query"
         if any(w in q for w in ["email", "mail", "message", "thread", "communicat"]):
             return "email_query"
         if any(w in q for w in ["secrets", "easter egg", "hidden", "plant"]):
             return "secrets_query"
+        if any(w in q for w in ["trouble", "problem", "issue", "conflict", "dispute", "complaint", "warning", "risk"]):
+            return "trouble_query"
         return "general_query"
 
-    def _template_answer(self, question: str, emails: list[dict], sql_results: list[dict], intent: str) -> str:
-        intent_responses = {
+    def _llm_summary(self, question: str, emails: list[dict], sql_results: list[dict], intent: str) -> str:
+        context_parts = []
+
+        if emails:
+            email_block = "RELEVANT EMAILS:\n"
+            for i, e in enumerate(emails[:8], 1):
+                tag = "[CONFIDENTIAL]" if e.get("sensitivity") == "confidential" else ""
+                email_block += f"{i}. {tag} From: {e['from_name']} ({e['department']}) → To: {e['to_name']}\n"
+                email_block += f"   Subject: {e['subject']}\n"
+                email_block += f"   Body: {e['body'][:500]}\n\n"
+            context_parts.append(email_block)
+
+        if sql_results:
+            context_parts.append(f"DATABASE RECORDS ({len(sql_results)}):\n" + json.dumps(sql_results[:5], indent=2))
+
+        if not emails and not sql_results:
+            return "No relevant data found for that question."
+
+        context = "\n".join(context_parts)
+
+        if self.llm_mode == "ollama":
+            result = ask_ollama(question, system=SYSTEM_PROMPT, prompt=f"Context:\n{context}")
+        elif self.llm_mode == "openai":
+            result = ask_openai(question, system=SYSTEM_PROMPT, prompt=f"Context:\n{context}",
+                                api_key=os.getenv("OPENAI_API_KEY", ""))
+        else:
+            return self._smart_template(question, emails, sql_results, intent)
+
+        result = (result or "").strip()
+        if result:
+            return result
+        return self._smart_template(question, emails, sql_results, intent)
+
+    def _smart_template(self, question: str, emails: list[dict], sql_results: list[dict], intent: str) -> str:
+        handlers = {
             "executive_query": self._answer_executive,
             "salary_query": self._answer_salary,
             "employee_query": self._answer_employees,
@@ -200,38 +226,42 @@ class RAGEngine:
             "personal_query": self._answer_personal,
             "email_query": self._answer_emails,
             "secrets_query": self._answer_secrets,
+            "hiding_query": self._answer_hiding,
+            "trouble_query": self._answer_trouble,
             "general_query": self._answer_general,
         }
-        handler = intent_responses.get(intent, self._answer_general)
-        return handler(question, emails, sql_results)
+        h = handlers.get(intent, self._answer_general)
+        return h(question, emails, sql_results)
+
+    # --- Structured answers for SQL-backed queries ---
 
     def _answer_executive(self, question, emails, sql_results) -> str:
         execs = [r for r in sql_results if r.get('department') == 'Executive']
         if not execs:
-            from .rag_engine import DatabaseQuery
-            dq = DatabaseQuery(self.db_path)
-            execs = dq.query("SELECT name, position, department, salary FROM employees WHERE department = 'Executive' ORDER BY salary DESC")
+            execs = self.db_query.query(
+                "SELECT name, position, department, salary FROM employees WHERE department = 'Executive' ORDER BY salary DESC"
+            )
         if execs:
-            lines = ["Executive team at NovaFi Financial:\n"]
-            ceo_name = None
+            lines = ["Executive team at NovaFi Financial:"]
+            ceo = None
             for e in execs:
                 lines.append(f"  \u2022 {e['name']} — {e['position']} (${e['salary']:,})")
                 if e.get('position') == 'CEO':
-                    ceo_name = e['name']
-            if ceo_name:
-                lines.append(f"\nThe CEO is {ceo_name}.")
+                    ceo = e['name']
+            if ceo:
+                lines.append(f"\nThe CEO is {ceo}.")
             return "\n".join(lines)
         return "No executive records found."
 
     def _answer_salary(self, question, emails, sql_results) -> str:
         if not sql_results:
             return "No salary data found."
-        lines = [f"Found {len(sql_results)} salary records:\n"]
+        lines = [f"Found {len(sql_results)} salary records:"]
         for r in sql_results[:10]:
             name = r.get('name', r.get('department', 'Unknown'))
             pos = r.get('position', '')
             salary = r.get('salary', r.get('avg_salary', 0))
-            if 'avg_salary' in r or 'department' in r and 'count' not in r:
+            if 'avg_salary' in r:
                 lines.append(f"  \u2022 {name}: ${salary:,}/yr (avg)")
             else:
                 lines.append(f"  \u2022 {name} ({pos}): ${salary:,}/yr")
@@ -241,34 +271,22 @@ class RAGEngine:
         if not sql_results:
             return "No employee records found."
         if 'count' in sql_results[0]:
-            lines = ["Employee count by department:\n"]
-            for r in sql_results:
-                lines.append(f"  \u2022 {r['department']}: {r['count']} employees")
-            return "\n".join(lines)
-        lines = [f"Found {len(sql_results)} employees:\n"]
+            return "\n".join([f"  \u2022 {r['department']}: {r['count']} employees" for r in sql_results])
+        lines = [f"Found {len(sql_results)} employees:"]
         for r in sql_results[:10]:
-            lines.append(f"  \u2022 {r['name']} — {r.get('position', r.get('email', ''))}")
+            lines.append(f"  \u2022 {r.get('name', '?')} — {r.get('position', r.get('email', ''))}")
         return "\n".join(lines)
 
     def _answer_customers(self, question, emails, sql_results) -> str:
         if not sql_results:
-            found_emails = [e for e in emails if any(w in (e.get('subject','') + e.get('body','')).lower()
-                            for w in ['customer', 'client', 'data', 'breach', 'phish', 'account'])]
-            if found_emails:
-                lines = ["No direct customer database results. Relevant emails found:\n"]
-                for e in found_emails[:3]:
-                    lines.append(f"  \u2022 {e['subject']} ({e['from_name']})")
-                return "\n".join(lines)
             return "No customer records found."
         if 'total_customers' in sql_results[0]:
-            return f"Total customers in database: {sql_results[0]['total_customers']}"
-        lines = [f"Found {len(sql_results)} customer records:\n"]
+            return f"Total customers: {sql_results[0]['total_customers']}"
+        lines = [f"Found {len(sql_results)} customers:"]
         for r in sql_results[:5]:
-            name = r['name']
             cc = r.get('credit_card_number', '')
             masked = f"{cc[:4]} **** **** {cc[-4:]}" if len(cc) > 4 else ''
-            risk = r.get('risk_score', '')
-            lines.append(f"  \u2022 {name} | Card: {masked} | Risk: {risk}")
+            lines.append(f"  \u2022 {r['name']} | {masked} | Risk: {r.get('risk_score', 'N/A')}")
         return "\n".join(lines)
 
     def _answer_orders(self, question, emails, sql_results) -> str:
@@ -278,106 +296,134 @@ class RAGEngine:
             r = sql_results[0]
             return f"Total orders: {r['total_orders']} | Total revenue: ${r['total_revenue']:,}"
         if 'revenue' in sql_results[0]:
-            lines = ["Monthly revenue:\n"]
+            lines = ["Monthly revenue:"]
             for r in sql_results:
                 lines.append(f"  \u2022 {r['month']}: ${r['revenue']:,} ({r['orders']} orders)")
             return "\n".join(lines[:6])
-        lines = [f"Found {len(sql_results)} orders:\n"]
+        lines = [f"Found {len(sql_results)} orders:"]
         for r in sql_results[:5]:
-            lines.append(f"  \u2022 {r['customer_name']} — {r['product']} — ${r['amount']:,.0f} ({r['status']})")
+            lines.append(f"  \u2022 {r['customer_name']} — {r['product']} — ${r['amount']:,.0f}")
         return "\n".join(lines)
 
+    # --- Semantic answers for natural language questions ---
+
     def _answer_security(self, question, emails, sql_results) -> str:
-        relevant = [e for e in emails if e.get('relevance_score', 0) > 0.3]
-        if relevant:
-            lines = [f"Found {len(relevant)} emails related to security:\n"]
-            for e in relevant[:5]:
-                sens = " [CONFIDENTIAL]" if e.get('sensitivity') == "confidential" else ""
-                lines.append(f"  \u2022 {e['subject']}{sens} ({e['department']})")
-                if any(w in e.get('body','').lower() for w in ['password', 'credential']):
-                    lines.append(f"    — Contains exposed credentials")
-                if any(w in e.get('body','').lower() for w in ['breach', 'exposed', 'compromised']):
-                    lines.append(f"    — Data breach related")
-            return "\n".join(lines)
-        return "No security-related communications found in the dataset."
+        if not emails:
+            return "No security-related communications found."
+        lines = [f"Found {len(emails)} relevant emails about security:"]
+        for e in emails[:5]:
+            tag = " [CONF]" if e.get('sensitivity') == "confidential" else ""
+            lines.append(f"  \u2022 {e['subject']}{tag}")
+            body = e.get('body', '').lower()
+            if 'breach' in body or 'exposed' in body:
+                lines.append(f"    \u2192 Data exposure incident")
+            if 'password' in body or 'credential' in body:
+                lines.append(f"    \u2192 Credential leak")
+        return "\n".join(lines)
 
     def _answer_layoffs(self, question, emails, sql_results) -> str:
-        relevant = [e for e in emails if e.get('relevance_score', 0) > 0.2]
-        if not relevant:
-            return "No documents about layoffs or restructuring found."
-        lines = [f"Found {len(relevant)} internal communications about restructuring:\n"]
-        for e in relevant[:4]:
-            sens = " [CONFIDENTIAL]" if e.get('sensitivity') == "confidential" else ""
-            lines.append(f"  \u2022 {e['subject']}{sens}")
-            lines.append(f"    From: {e['from_name']} ({e['timestamp'][:10]})")
-            body_lower = e.get('body', '').lower()
-            if 'phoenix' in body_lower:
-                lines.append(f"    — References Project Phoenix (workforce reduction)")
-            if 'offshore' in body_lower:
-                lines.append(f"    — Discusses offshoring plans")
+        if not emails:
+            return "No communications about layoffs or restructuring found."
+        lines = [f"Found {len(emails)} internal communications about restructuring:"]
+        for e in emails[:4]:
+            tag = " [CONF]" if e.get('sensitivity') == "confidential" else ""
+            lines.append(f"  \u2022 {e['subject']}{tag}")
+            body = e.get('body', '').lower()
+            if 'phoenix' in body:
+                lines.append(f"    \u2192 References Project Phoenix (workforce reduction)")
+            if 'offshore' in body:
+                lines.append(f"    \u2192 Discusses offshoring")
+            if 'layoff' in body or 'reduction' in body:
+                lines.append(f"    \u2192 Layoff related")
         return "\n".join(lines)
 
     def _answer_personal(self, question, emails, sql_results) -> str:
-        relevant = [e for e in emails if e.get('sensitivity') == "confidential"]
-        personal = [e for e in relevant if any(w in e.get('body', '').lower()
-                    for w in ['dinner', 'paris', 'personal', 'weekend'])]
+        personal = [e for e in emails if e.get('sensitivity') == 'confidential' and
+                    any(w in e.get('body', '').lower() for w in ['dinner', 'paris', 'weekend', 'personal'])]
         if not personal:
-            return "No personal or confidential communications found in this dataset."
-        lines = [f"Found {len(personal)} confidential personal communications:\n"]
+            return "No personal or confidential communications found."
+        lines = [f"Found {len(personal)} confidential personal communications:"]
         for e in personal[:4]:
             lines.append(f"  \u2022 {e['subject']}")
             lines.append(f"    {e['from_name']} \u2192 {e['to_name']}")
-            lines.append(f"    {e['body'][:200]}")
         return "\n".join(lines)
 
     def _answer_emails(self, question, emails, sql_results) -> str:
         if not emails:
             return "No emails matched your query."
-        lines = [f"Found {len(emails)} relevant emails:\n"]
+        lines = [f"Found {len(emails)} relevant emails:"]
         for e in emails[:8]:
-            ts = e['timestamp'][:19].replace('T', ' ')
-            sens = " [CONF]" if e.get('sensitivity') == "confidential" else ""
-            lines.append(f"  \u2022 {ts}{sens}")
-            lines.append(f"    {e['from_name']} \u2192 {e['to_name']}")
-            lines.append(f"    Subject: {e['subject']}")
+            tag = " [CONF]" if e.get('sensitivity') == "confidential" else ""
+            lines.append(f"  \u2022 {e['subject']}{tag}")
+            lines.append(f"    {e['from_name']} \u2192 {e['to_name']} ({e['department']})")
         return "\n".join(lines)
 
     def _answer_secrets(self, question, emails, sql_results) -> str:
-        lines = ["Planted secrets in the NovaFi dataset:\n"]
+        lines = ["Planted secrets in the NovaFi dataset:"]
         for s in self.secrets_data.get("secrets", []):
             lines.append(f"  [{s['difficulty']}] {s['name']}")
             lines.append(f"    {s['description']}")
         return "\n".join(lines)
 
+    def _answer_hiding(self, question, emails, sql_results) -> str:
+        confidential = [e for e in emails if e.get('sensitivity') == 'confidential']
+        if not emails:
+            return "No evidence found of the company hiding anything."
+        lines = [f"Analysis of {len(emails)} relevant communications. Key findings:"]
+        confidential = [e for e in emails if e.get('sensitivity') == 'confidential']
+        if confidential:
+            lines.append(f"\n  \u2022 {len(confidential)} confidential emails found. Topics include:")
+            topics = set()
+            for e in confidential[:5]:
+                topics.add(e['subject'])
+            for t in list(topics)[:4]:
+                lines.append(f"    — {t}")
+        breach_emails = [e for e in emails if 'breach' in e.get('body', '').lower() or 'exposed' in e.get('body', '').lower()]
+        if breach_emails:
+            lines.append(f"\n  \u2022 {len(breach_emails)} emails discuss a data breach or data exposure")
+        layoff_emails = [e for e in emails if any(w in e.get('body', '').lower() for w in ['layoff', 'phoenix', 'offshore', 'reduction'])]
+        if layoff_emails:
+            lines.append(f"  \u2022 {len(layoff_emails)} emails reference layoffs, offshoring, or restructuring")
+        personal = [e for e in emails if 'dinner' in e.get('body', '').lower() or 'paris' in e.get('body', '').lower()]
+        if personal:
+            lines.append(f"  \u2022 Personal relationship detected between executive and HR (confidential)")
+        return "\n".join(lines)
+
+    def _answer_trouble(self, question, emails, sql_results) -> str:
+        if not emails:
+            return "No signs of trouble found in the dataset."
+        lines = [f"Scanned {len(emails)} relevant communications for signs of trouble:"]
+        complaint = [e for e in emails if 'complaint' in e.get('body', '').lower() or 'discrimination' in e.get('body', '').lower()]
+        if complaint:
+            lines.append(f"\n  \u2022 Formal complaint: {complaint[0]['subject']}")
+        breach = [e for e in emails if 'breach' in e.get('body', '').lower()]
+        if breach:
+            lines.append(f"  \u2022 Security incident: {breach[0]['subject']}")
+        layoff = [e for e in emails if any(w in e.get('body', '').lower() for w in ['layoff', 'phoenix', 'reduction'])]
+        if layoff:
+            lines.append(f"  \u2022 Restructuring: {layoff[0]['subject']}")
+        dispute = [e for e in emails if 'dispute' in e.get('body', '').lower() or 'unauthorized' in e.get('body', '').lower()]
+        if dispute:
+            lines.append(f"  \u2022 Customer dispute: {dispute[0]['subject']}")
+        if not complaint and not breach and not layoff and not dispute:
+            from collections import Counter
+            depts = Counter(e.get('department', 'Unknown') for e in emails)
+            top_dept = depts.most_common(1)
+            if top_dept:
+                lines.append(f"\n  No specific trouble found. Most activity in: {top_dept[0][0]}")
+        return "\n".join(lines)
+
     def _answer_general(self, question, emails, sql_results) -> str:
         parts = []
         if emails:
-            parts.append(f"Found {len(emails)} relevant emails in the dataset.")
+            parts.append(f"Found {len(emails)} relevant emails.")
             for e in emails[:3]:
-                parts.append(f"  \u2022 {e['subject']} ({e['department']}, {e['from_name']})")
+                tag = " [CONF]" if e.get('sensitivity') == "confidential" else ""
+                parts.append(f"  \u2022 {e['subject']}{tag} ({e['department']})")
         if sql_results:
             parts.append(f"\n{len(sql_results)} database records found.")
             for r in sql_results[:3]:
                 parts.append(f"  \u2022 {r}")
         if not parts:
-            return "No results found. Try searching for: employees, salaries, customers, orders, security incidents, or specific topics like layoffs or breaches."
+            return "No results found. Try asking about: employees, salaries, customers, orders, security incidents, layoffs, or confidential communications."
         return "\n".join(parts)
-
-    def _llm_answer(self, question: str, context: str, llm_client, intent: str) -> str:
-        system_prompt = """You are a cybersecurity investigation assistant. You have accessed a corporate dataset from NovaFi Financial Solutions.
-Answer questions based ONLY on the provided context below. If the context doesn't contain the answer, say so.
-Format your response like a hacker terminal - concise, factual, with a sense of discovery.
-Use > prompt-style formatting. Highlight sensitive findings."""
-        try:
-            response = llm_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
-                ],
-                max_tokens=800,
-                temperature=0.7,
-            )
-            return response.choices[0].message.content
-        except Exception:
-            return self._template_answer(question, [], [], intent)

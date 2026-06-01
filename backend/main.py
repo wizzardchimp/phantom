@@ -42,9 +42,7 @@ class QueryResponse(BaseModel):
     response: str
     emails_found: int
     records_found: int
-    top_emails: list
-    sql_results: list
-    sql_used: Optional[str] = None
+    llm_used: bool = False
 
 
 class SQLQueryRequest(BaseModel):
@@ -83,18 +81,8 @@ async def get_stats():
 
 @app.post("/query", response_model=QueryResponse)
 async def query_data(request: QueryRequest):
-    llm_client = None
-    if request.use_llm:
-        try:
-            from openai import OpenAI
-            api_key = os.getenv("OPENAI_API_KEY")
-            if api_key:
-                llm_client = OpenAI(api_key=api_key)
-        except ImportError:
-            pass
-
     try:
-        result = engine.query(request.query, use_llm=request.use_llm and llm_client is not None, llm_client=llm_client)
+        result = engine.query(request.query)
         return QueryResponse(**result)
     except Exception as e:
         raise HTTPException(500, f"Query failed: {str(e)}")
